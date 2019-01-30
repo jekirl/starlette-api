@@ -6,7 +6,7 @@ from starlette.endpoints import HTTPEndpoint as BaseHTTPEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import Receive, Send
-
+from starlette.background import BackgroundTasks
 import marshmallow
 
 
@@ -42,7 +42,9 @@ class HTTPEndpoint(BaseHTTPEndpoint):
             response = await injected_func()
         else:
             response = injected_func()
-
+        tasks = None
+        if isinstance(response, tuple) and len(response) == 2 and isinstance(response[1], BackgroundTasks):
+            response, tasks = response
         return_annotation = inspect.signature(handler).return_annotation
         if issubclass(return_annotation, marshmallow.Schema):
             response = return_annotation().dump(response)
@@ -51,5 +53,6 @@ class HTTPEndpoint(BaseHTTPEndpoint):
             response = JSONResponse(response)
         elif isinstance(response, str):
             response = Response(response)
-
+        if tasks is not None:
+            response.background = tasks
         return response
