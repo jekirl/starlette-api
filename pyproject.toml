@@ -33,8 +33,6 @@ pyyaml = "^3.13"
 apispec = "^0.39.0"
 flake8 = "^3.7"
 
-[tool.poetry.extras]
-full = ["apispec","pyyaml"]
 
 [tool.black]
 line-length = 120
