@@ -1,0 +1,1 @@
+recursive-include starlette_api/templates *
