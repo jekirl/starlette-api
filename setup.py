@@ -27,7 +27,7 @@ setup(
     name='starlette-api',  # Required
     # https://www.python.org/dev/peps/pep-0440/
     # https://packaging.python.org/en/latest/single_source_version.html
-    version='0.4.1',  # Required
+    version='0.5.0',  # Required
     # https://packaging.python.org/specifications/core-metadata/#summary
     description="Starlette API layer inherited from APIStar",  # Required
     # https://packaging.python.org/specifications/core-metadata/#description-optional
@@ -48,8 +48,11 @@ setup(
     packages=find_packages(),  # Required
     # https://packaging.python.org/en/latest/requirements.html
     install_requires=[
-        'starlette (>=0.9.10)',
+        'starlette (>=0.11)',
         'marshmallow (>2)',
+        'python-forge (>=18.6,<19.0)',
+        'sqlalchemy (>=1.2,<2.0)',
+        'databases (>=0.1.9,<0.2.0)',
     ],  # Optional
     # https://setuptools.readthedocs.io/en/latest/setuptools.html#dependencies-that-aren-t-in-pypi
     dependency_links=[],  # Optional
