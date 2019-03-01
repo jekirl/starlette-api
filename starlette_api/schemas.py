@@ -64,12 +64,13 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
 
         for route in routes:
             if isinstance(route, routing.Route) and route.include_in_schema:
+                _, path, _ = routing.compile_path(base_path + route.path)
+
                 if inspect.isfunction(route.endpoint) or inspect.ismethod(route.endpoint):
                     for method in route.methods or ["GET"]:
                         if method == "HEAD":
                             continue
 
-                        path = base_path + route.path
                         endpoints_info[path].append(
                             EndpointInfo(
                                 path=path,
@@ -86,7 +87,6 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
                         if not hasattr(route.endpoint, method):
                             continue
 
-                        path = base_path + route.path
                         func = getattr(route.endpoint, method)
                         endpoints_info[path].append(
                             EndpointInfo(
@@ -174,9 +174,20 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
 
 
 class SchemaMixin:
-    def add_schema_route(self):
-        self.schema_generator = SchemaGenerator(title=self.title, version=self.version, description=self.description)
+    @property
+    def schema_generator(self):
+        if not hasattr(self, "_schema_generator"):
+            self._schema_generator = SchemaGenerator(
+                title=self.title, version=self.version, description=self.description
+            )
 
+        return self._schema_generator
+
+    @property
+    def schema(self):
+        return self.schema_generator.get_schema(self.routes)
+
+    def add_schema_route(self):
         def schema():
             return OpenAPIResponse(self.schema)
 

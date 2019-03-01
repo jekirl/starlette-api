@@ -3,7 +3,7 @@
 [![codecov](https://codecov.io/gh/PeRDy/starlette-api/branch/master/graph/badge.svg)](https://codecov.io/gh/PeRDy/starlette-api)
 [![PyPI version](https://badge.fury.io/py/starlette-api.svg)](https://badge.fury.io/py/starlette-api)
 
-* **Version:** 0.4.1
+* **Version:** 0.5.0
 * **Status:** Production/Stable
 * **Author:** José Antonio Perdiguero López
 
@@ -12,6 +12,7 @@
 That library aims to bring a layer on top of Starlette framework to provide useful mechanism for building APIs. It's 
 based on API Star, inheriting some nice ideas like:
 
+* **Generic classes** for API resources that provides standard CRUD methods over SQLAlchemy tables.
 * **Schema system** based on [Marshmallow](https://github.com/marshmallow-code/marshmallow/) that allows to **declare**
 the inputs and outputs of endpoints and provides a reliable way of **validate** data against those schemas.
 * **Dependency Injection** that ease the process of managing parameters needed in endpoints.
@@ -23,6 +24,7 @@ injected in your endpoints.
 necessary information to generate your API Schema.
 * **Auto generated docs** providing a [Swagger UI](https://swagger.io/tools/swagger-ui/) or 
 [ReDocs](https://rebilly.github.io/ReDoc/) endpoint.
+* **Pagination** automatically handled using multiple methods such as limit and offset, page numbers...
 
 ## Requirements
 
