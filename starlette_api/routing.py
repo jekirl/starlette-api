@@ -6,17 +6,17 @@ from functools import wraps
 import marshmallow
 import starlette.routing
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse, Response
 from starlette.routing import Match, Mount
 from starlette.types import ASGIApp, ASGIInstance, Receive, Scope, Send
 
-from starlette_api import http
+from starlette_api import http, websockets
 from starlette_api.components import Component
 from starlette_api.responses import APIResponse
 from starlette_api.types import Field, FieldLocation, OptBool, OptFloat, OptInt, OptStr
 from starlette_api.validation import get_output_schema
 
 __all__ = ["Route", "WebSocketRoute", "Router"]
+
 
 FieldsMap = typing.Dict[str, Field]
 MethodsMap = typing.Dict[str, FieldsMap]
@@ -26,6 +26,8 @@ PATH_SCHEMA_MAPPING = {
     int: marshmallow.fields.Integer,
     float: marshmallow.fields.Number,
     str: marshmallow.fields.String,
+    bool: marshmallow.fields.Boolean,
+    http.PathParam: marshmallow.fields.String,
 }
 
 QUERY_SCHEMA_MAPPING = {
@@ -97,11 +99,13 @@ class FieldsMixin:
 
             # Matches as path param
             if name in self.param_convertors.keys():
+                try:
+                    schema = PATH_SCHEMA_MAPPING[param.annotation]
+                except KeyError:
+                    schema = marshmallow.fields.String
+
                 path_fields[name] = Field(
-                    name=name,
-                    location=FieldLocation.path,
-                    schema=PATH_SCHEMA_MAPPING[param.annotation](required=True),
-                    required=True,
+                    name=name, location=FieldLocation.path, schema=schema(required=True), required=True
                 )
 
             # Matches as query param
@@ -159,6 +163,7 @@ class Route(starlette.routing.Route, FieldsMixin):
                     "app": app,
                     "path_params": route_scope["path_params"],
                     "route": route,
+                    "request": http.Request(scope, receive),
                 }
 
                 injected_func = await app.injector.inject(endpoint, state)
@@ -172,9 +177,9 @@ class Route(starlette.routing.Route, FieldsMixin):
                 if isinstance(response, (dict, list)):
                     response = APIResponse(content=response, schema=get_output_schema(endpoint))
                 elif isinstance(response, str):
-                    response = Response(content=response)
+                    response = APIResponse(content=response)
                 elif response is None:
-                    response = JSONResponse()
+                    response = APIResponse(content="")
 
                 await response(receive, send)
 
@@ -213,6 +218,7 @@ class WebSocketRoute(starlette.routing.WebSocketRoute, FieldsMixin):
                     "app": app,
                     "path_params": route_scope["path_params"],
                     "route": route,
+                    "websocket": websockets.WebSocket(scope, receive, send),
                 }
 
                 injected_func = await app.injector.inject(endpoint, state)
@@ -252,6 +258,7 @@ class Router(starlette.routing.Router):
         if isinstance(app, Router):
             app.components = self.components
 
+        path = path.rstrip("/")
         route = Mount(path, app=app, name=name)
         self.routes.append(route)
 
@@ -272,20 +279,21 @@ class Router(starlette.routing.Router):
         return decorator
 
     def get_route_from_scope(self, scope) -> typing.Tuple[Route, typing.Optional[typing.Dict]]:
-        if "root_path" in scope:
-            scope["path"] = scope["root_path"] + scope["path"]
-            scope["root_path"] = ""
-
         partial = None
 
         for route in self.routes:
+            if isinstance(route, Mount):
+                path = scope.get("path", "")
+                root_path = scope.pop("root_path", "")
+                scope["path"] = root_path + path
+
             match, child_scope = route.matches(scope)
             if match == Match.FULL:
                 scope.update(child_scope)
 
                 if isinstance(route, Mount):
-                    scope["root_path"] = ""
-                    return route.app.get_route_from_scope(scope)
+                    route, mount_scope = route.app.get_route_from_scope(scope)
+                    return route, mount_scope
 
                 return route, scope
             elif match == Match.PARTIAL and partial is None:

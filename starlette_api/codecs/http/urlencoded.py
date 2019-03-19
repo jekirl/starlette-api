@@ -1,8 +1,10 @@
 from starlette_api import http
-from starlette_api.codecs.base import BaseCodec
+from starlette_api.codecs.base import HTTPCodec
+
+__all__ = ["URLEncodedCodec"]
 
 
-class URLEncodedCodec(BaseCodec):
+class URLEncodedCodec(HTTPCodec):
     media_type = "application/x-www-form-urlencoded"
 
     async def decode(self, request: http.Request, **options):

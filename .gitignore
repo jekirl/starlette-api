@@ -42,9 +42,11 @@ coverage.xml
 *,cover
 .pytest_cache/
 .test_report/
+test-results/
 
-# Sphinx documentation
+## Docs
 docs/_build/
+site/
 
 node_modules
 *.vscode

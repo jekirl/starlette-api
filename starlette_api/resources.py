@@ -1,131 +1,171 @@
+import datetime
 import logging
 import re
 import typing
+import uuid
 
 import databases
 import marshmallow
 import sqlalchemy
-from sqlalchemy import inspect
+from sqlalchemy.dialects import postgresql
 
 from starlette_api.applications import Starlette
 from starlette_api.exceptions import HTTPException
 from starlette_api.pagination import Paginator
 from starlette_api.responses import APIResponse
+from starlette_api.types import Model, PrimaryKey, ResourceMeta, ResourceMethodMeta
 
 logger = logging.getLogger(__name__)
 
 
-class StringIDSchema(marshmallow.Schema):
-    id = marshmallow.fields.String(title="id", description="Element ID", required=True)
+__all__ = ["resource_method", "CRUDResource", "CRUDListResource", "CRUDListDropResource"]
 
 
-class IntegerIDSchema(marshmallow.Schema):
-    id = marshmallow.fields.Integer(title="id", description="Element ID", required=True)
+PK_MAPPING = {
+    sqlalchemy.Integer: int,
+    sqlalchemy.String: str,
+    sqlalchemy.Date: datetime.date,
+    sqlalchemy.DateTime: datetime.datetime,
+    postgresql.UUID: uuid.UUID,
+}
 
 
 class DropSchema(marshmallow.Schema):
     deleted = marshmallow.fields.Integer(title="deleted", description="Number of deleted elements", required=True)
 
 
-OUTPUT_SCHEMAS = {str: StringIDSchema, int: IntegerIDSchema}
+def resource_method(path: str, methods: typing.List[str] = None, name: str = None, **kwargs) -> typing.Callable:
+    def wrapper(func: typing.Callable) -> typing.Callable:
+        func._meta = ResourceMethodMeta(
+            path=path, methods=methods if methods is not None else ["GET"], name=name, kwargs=kwargs
+        )
+
+        return func
+
+    return wrapper
+
+
+class ResourceRoutes:
+    """Routes descriptor"""
+
+    def __init__(self, methods: typing.Dict[str, typing.Callable]):
+        self.methods = methods
+
+    def __get__(self, instance, owner) -> typing.Dict[str, typing.Callable]:
+        return self.methods
 
 
 class BaseResource(type):
-    METHODS = {}  # type: typing.Dict[str, typing.Tuple[str, str]]
-    DEFAULT_METHODS = ()  # type: typing.Sequence[str]
+    METHODS = ()  # type: typing.Sequence[str]
 
     def __new__(mcs, name, bases, namespace):
-        try:
-            database = namespace["database"]
-        except KeyError as e:
-            raise AttributeError(f"{name} needs to define attribute {e}")
+        # Get database and replace it with a read-only descriptor
+        database = mcs._get_attribute("database", name, namespace, bases)
+        namespace["database"] = property(lambda self: self._meta.database)
 
-        # Get model and model primary key
-        model, model_pk_name, model_pk_type = mcs.get_model(name, namespace)
+        # Get model and replace it with a read-only descriptor
+        model = mcs._get_model(name, namespace, bases)
+        namespace["model"] = property(lambda self: self._meta.model.table)
 
         # Define resource names
-        resource_name, verbose_name = mcs.get_resource_name(name, namespace)
-        namespace["name"] = resource_name
-        namespace["verbose_name"] = verbose_name
+        resource_name, verbose_name = mcs._get_resource_name(name, namespace)
 
         # Default columns and order for admin interface
-        namespace["columns"] = namespace.get("columns", [model_pk_name])
-        namespace["order"] = namespace.get("order", model_pk_name)
-
-        # Get resource methods
-        available_methods = mcs.get_available_methods(name, namespace)
+        columns = namespace.pop("columns", [model.primary_key.name])
+        order = namespace.pop("order", model.primary_key.name)
 
         # Get input and output schemas
-        input_schema, output_schema = mcs.get_schemas(name, namespace)
+        input_schema, output_schema = mcs._get_schemas(name, namespace, bases)
+
+        namespace["_meta"] = ResourceMeta(
+            database=database,
+            model=model,
+            name=resource_name,
+            verbose_name=verbose_name,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            columns=columns,
+            order=order,
+        )
 
         # Create CRUD methods and routes
-        mcs.add_methods(
-            namespace, available_methods, database, input_schema, output_schema, model_pk_name, model_pk_type
-        )
-        mcs.add_routes(namespace, available_methods)
+        mcs._add_methods(resource_name, verbose_name, namespace, database, input_schema, output_schema, model)
+        mcs._add_routes(namespace)
 
-        return type(name, bases, namespace)
+        return super().__new__(mcs, name, bases, namespace)
 
     @classmethod
-    def get_resource_name(mcs, name: str, namespace: typing.Dict[str, typing.Any]) -> typing.Tuple[str, str]:
-        resource_name = namespace.get("name", name.lower())
+    def _get_attribute(
+        mcs, attribute: str, name: str, namespace: typing.Dict[str, typing.Any], bases: typing.Sequence[typing.Any]
+    ) -> typing.Any:
+        try:
+            return namespace.pop(attribute)
+        except KeyError:
+            for base in bases:
+                if hasattr(base, "_meta") and hasattr(base._meta, attribute):
+                    return getattr(base._meta, attribute)
+                elif hasattr(base, attribute):
+                    return getattr(base, attribute)
+
+        raise AttributeError(f"{name} needs to define attribute '{attribute}'")
+
+    @classmethod
+    def _get_resource_name(mcs, name: str, namespace: typing.Dict[str, typing.Any]) -> typing.Tuple[str, str]:
+        resource_name = namespace.pop("name", name.lower())
 
         # Check resource name validity
         if re.match("[a-zA-Z][-_a-zA-Z]", resource_name) is None:
             raise AttributeError(f"Invalid resource name '{resource_name}'")
 
-        return resource_name, namespace.get("verbose_name", resource_name)
+        return resource_name, namespace.pop("verbose_name", resource_name)
 
     @classmethod
-    def get_model(mcs, name: str, namespace: typing.Dict[str, typing.Any]) -> typing.Tuple[sqlalchemy.Table, str, type]:
-        try:
-            model = namespace["model"]
-        except KeyError as e:
-            raise AttributeError(f"{name} needs to define attribute {e}")
+    def _get_model(
+        mcs, name: str, namespace: typing.Dict[str, typing.Any], bases: typing.Sequence[typing.Any]
+    ) -> Model:
+        model = mcs._get_attribute("model", name, namespace, bases)
 
-        # Get model primary key
-        model_pk = list(inspect(model).primary_key.columns.values())
+        # Already defined model probably because resource inheritance, so no need to create it
+        if isinstance(model, Model):
+            return model
 
-        # Check primary key exists and is a single column
-        if len(model_pk) != 1:
-            raise AttributeError(f"{name} model must define a single-column primary key")
+        # Resource define model as a sqlalchemy Table, so extract necessary info from it
+        elif isinstance(model, sqlalchemy.Table):
+            # Get model primary key
+            model_pk = list(sqlalchemy.inspect(model).primary_key.columns.values())
 
-        model_pk_name = model_pk[0].name
-        model_pk_type = model_pk[0].type.python_type
+            # Check primary key exists and is a single column
+            if len(model_pk) != 1:
+                raise AttributeError(f"{name} model must define a single-column primary key")
 
-        # Check primary key is a valid type
-        if model_pk_type not in (str, int):
-            raise AttributeError(f"{name} model primary key must be Integer or String column type")
+            model_pk = model_pk[0]
+            model_pk_name = model_pk.name
 
-        return model, model_pk_name, model_pk_type
+            # Check primary key is a valid type
+            try:
+                model_pk_type = PK_MAPPING[model_pk.type.__class__]
+            except KeyError:
+                raise AttributeError(
+                    f"{name} model primary key must be any of {', '.join((i.__name__ for i in PK_MAPPING.keys()))}"
+                )
 
-    @classmethod
-    def get_available_methods(mcs, name: str, namespace: typing.Dict[str, typing.Any]) -> typing.Sequence[str]:
-        try:
-            methods = namespace["methods"]
+            return Model(table=model, primary_key=PrimaryKey(model_pk_name, model_pk_type))
 
-            not_implemented_methods = {i for i in methods if not (i in namespace or i in mcs.METHODS)}
-            if not_implemented_methods:
-                raise AttributeError(f'{name} custom methods not found: "{", ".join(not_implemented_methods)}"')
-        except KeyError:
-            logger.warning("%s is not defining methods list so default list is used %s", name, str(mcs.DEFAULT_METHODS))
-            methods = mcs.DEFAULT_METHODS
-
-        return methods
+        raise AttributeError(f"{name} model must be a valid SQLAlchemy Table instance or a Model instance")
 
     @classmethod
-    def get_schemas(
-        mcs, name: str, namespace: typing.Dict[str, typing.Any]
+    def _get_schemas(
+        mcs, name: str, namespace: typing.Dict[str, typing.Any], bases: typing.Sequence[typing.Any]
     ) -> typing.Tuple[marshmallow.Schema, marshmallow.Schema]:
         try:
-            schema = namespace["schema"]
+            schema = mcs._get_attribute("schema", name, namespace, bases)
             input_schema = schema
             output_schema = schema
-        except KeyError:
+        except AttributeError:
             try:
-                input_schema = namespace["input_schema"]
-                output_schema = namespace["output_schema"]
-            except KeyError:
+                input_schema = mcs._get_attribute("input_schema", name, namespace, bases)
+                output_schema = mcs._get_attribute("output_schema", name, namespace, bases)
+            except AttributeError:
                 raise AttributeError(
                     f"{name} needs to define attribute 'schema' or the pair 'input_schema' and 'output_schema'"
                 )
@@ -133,86 +173,110 @@ class BaseResource(type):
         return input_schema, output_schema
 
     @classmethod
-    def add_routes(mcs, namespace: typing.Dict[str, typing.Any], methods: typing.Iterable[str]):
-        class Routes:
-            """Routes descriptor"""
+    def _add_routes(mcs, namespace: typing.Dict[str, typing.Any]):
+        def _add_routes(self, app: "Starlette", root_path: str = "/"):
+            for name, route in self.routes.items():
+                path = root_path + self._meta.name + route._meta.path
+                bound_route = getattr(self, name)
+                name = route._meta.name if route._meta.name is not None else f"{self._meta.name}-{route.__name__}"
+                app.add_route(path, bound_route, route._meta.methods, name, **route._meta.kwargs)
 
-            def __get__(self, instance, owner):
-                return [
-                    {
-                        "path": mcs.METHODS[method][0],
-                        "route": getattr(owner, method),
-                        "methods": [mcs.METHODS[method][1]],
-                        "name": method,
-                    }
-                    for method in methods
-                ]
+        methods = {name: m for name, m in namespace.items() if getattr(m, "_meta", False) and not name.startswith("_")}
+        routes = ResourceRoutes(methods)
 
-        def _add_routes(cls, app: "Starlette", root_path: str = "/"):
-            for route in cls.routes:
-                path = root_path + cls.name + route.pop("path")
-                app.add_route(path=path, **route)
-
-        namespace["routes"] = Routes()
-        namespace["add_routes"] = classmethod(_add_routes)
+        namespace["routes"] = routes
+        namespace["add_routes"] = _add_routes
 
     @classmethod
-    def add_methods(
+    def _add_methods(
         mcs,
+        name: str,
+        verbose_name: str,
         namespace: typing.Dict[str, typing.Any],
-        methods: typing.Iterable[str],
         database: "databases.Database",
         input_schema: marshmallow.Schema,
         output_schema: marshmallow.Schema,
-        model_pk_name: str,
-        model_pk_type,
+        model: Model,
     ):
+        # Get available methods
+        methods = [getattr(mcs, f"_add_{method}") for method in mcs.METHODS if hasattr(mcs, f"_add_{method}")]
+
         # Generate CRUD methods
         crud_namespace = {
             func_name: func
             for method in methods
-            for func_name, func in getattr(mcs, "add_{}".format(method))(
+            for func_name, func in method(
+                name=name,
+                verbose_name=verbose_name,
                 database=database,
                 input_schema=input_schema,
                 output_schema=output_schema,
-                model_pk_name=model_pk_name,
-                model_pk_type=model_pk_type,
+                model=model,
             ).items()
         }
 
         # Preserve already defined methods
-        crud_namespace.update({method: crud_namespace[f"_{method}"] for method in methods if method not in namespace})
+        crud_namespace.update(
+            {method: crud_namespace[f"_{method}"] for method in mcs.METHODS if method not in namespace}
+        )
 
         namespace.update(crud_namespace)
 
 
 class CreateMixin:
     @classmethod
-    def add_create(mcs, database, input_schema, model_pk_type, **kwargs) -> typing.Dict[str, typing.Any]:
-        output_schema = OUTPUT_SCHEMAS[model_pk_type]
-
+    def _add_create(
+        mcs,
+        name: str,
+        verbose_name: str,
+        database: databases.Database,
+        input_schema: marshmallow.Schema,
+        output_schema: marshmallow.Schema,
+        **kwargs,
+    ) -> typing.Dict[str, typing.Any]:
+        @resource_method("/", methods=["POST"], name=f"{name}-create")
         @database.transaction()
-        async def create(cls, element: input_schema) -> output_schema:
-            """
+        async def create(self, element: input_schema) -> output_schema:
+            query = self.model.insert().values(**element)
+            await self.database.execute(query)
+            return APIResponse(schema=output_schema(), content=element, status_code=201)
+
+        create.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                Create a new document.
             description:
                 Create a new document in this resource.
             responses:
                 201:
                     description:
                         Document created successfully.
-            """
-            query = cls.model.insert().values(**element)
-            result = await cls.database.execute(query)
-            return APIResponse(schema=output_schema(), content={"id": result}, status_code=201)
+        """
 
-        return {"_create": classmethod(create)}
+        return {"_create": create}
 
 
 class RetrieveMixin:
     @classmethod
-    def add_retrieve(mcs, output_schema, model_pk_name, model_pk_type, **kwargs) -> typing.Dict[str, typing.Any]:
-        async def retrieve(cls, element_id: model_pk_type) -> output_schema:
-            """
+    def _add_retrieve(
+        mcs, name: str, verbose_name: str, output_schema: marshmallow.Schema, model: Model, **kwargs
+    ) -> typing.Dict[str, typing.Any]:
+        @resource_method("/{element_id}/", methods=["GET"], name=f"{name}-retrieve")
+        async def retrieve(self, element_id: model.primary_key.type) -> output_schema:
+            query = self.model.select().where(self.model.c[model.primary_key.name] == element_id)
+            element = await self.database.fetch_one(query)
+
+            if element is None:
+                raise HTTPException(status_code=404)
+
+            return dict(element)
+
+        retrieve.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                Retrieve a document.
             description:
                 Retrieve a document from this resource.
             responses:
@@ -222,24 +286,41 @@ class RetrieveMixin:
                 404:
                     description:
                         Document not found.
-            """
-            query = cls.model.select().where(cls.model.c[model_pk_name] == element_id)
-            element = await cls.database.fetch_one(query)
+        """
 
-            if element is None:
-                raise HTTPException(status_code=404)
-
-            return dict(element)
-
-        return {"_retrieve": classmethod(retrieve)}
+        return {"_retrieve": retrieve}
 
 
 class UpdateMixin:
     @classmethod
-    def add_update(mcs, database, input_schema, model_pk_name, model_pk_type, **kwargs) -> typing.Dict[str, typing.Any]:
+    def _add_update(
+        mcs,
+        name: str,
+        verbose_name: str,
+        database: databases.Database,
+        input_schema: marshmallow.Schema,
+        output_schema: marshmallow.Schema,
+        model: Model,
+        **kwargs,
+    ) -> typing.Dict[str, typing.Any]:
+        @resource_method("/{element_id}/", methods=["PUT"], name=f"{name}-update")
         @database.transaction()
-        async def update(cls, element_id: model_pk_type, element: input_schema):
-            """
+        async def update(self, element_id: model.primary_key.type, element: input_schema) -> output_schema:
+            query = sqlalchemy.select([sqlalchemy.exists().where(self.model.c[model.primary_key.name] == element_id)])
+            exists = next((i for i in (await self.database.fetch_one(query)).values()))
+            if not exists:
+                raise HTTPException(status_code=404)
+
+            query = self.model.update().where(self.model.c[model.primary_key.name] == element_id).values(**element)
+            await self.database.execute(query)
+
+            return {model.primary_key.name: element_id, **element}
+
+        update.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                Update a document.
             description:
                 Update a document in this resource.
             responses:
@@ -249,24 +330,34 @@ class UpdateMixin:
                 404:
                     description:
                         Document not found.
-            """
-            query = sqlalchemy.exists(cls.model.select().where(cls.model.c[model_pk_name] == element_id)).select()
-            exists = (await cls.database.fetch_one(query))[0]
-            if not exists:
-                raise HTTPException(status_code=404)
+        """
 
-            query = cls.model.update().where(cls.model.c[model_pk_name] == element_id).values(**element)
-            await cls.database.execute(query)
-
-        return {"_update": classmethod(update)}
+        return {"_update": update}
 
 
 class DeleteMixin:
     @classmethod
-    def add_delete(mcs, database, model_pk_name, model_pk_type, **kwargs) -> typing.Dict[str, typing.Any]:
+    def _add_delete(
+        mcs, name: str, verbose_name: str, database: databases.Database, model: Model, **kwargs
+    ) -> typing.Dict[str, typing.Any]:
+        @resource_method("/{element_id}/", methods=["DELETE"], name=f"{name}-delete")
         @database.transaction()
-        async def delete(cls, element_id: model_pk_type):
-            """
+        async def delete(self, element_id: model.primary_key.type):
+            query = sqlalchemy.select([sqlalchemy.exists().where(self.model.c[model.primary_key.name] == element_id)])
+            exists = next((i for i in (await self.database.fetch_one(query)).values()))
+            if not exists:
+                raise HTTPException(status_code=404)
+
+            query = self.model.delete().where(self.model.c[model.primary_key.name] == element_id)
+            await self.database.execute(query)
+
+            return APIResponse(status_code=204)
+
+        delete.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                Delete a document.
             description:
                 Delete a document in this resource.
             responses:
@@ -276,79 +367,86 @@ class DeleteMixin:
                 404:
                     description:
                         Document not found.
-            """
-            query = sqlalchemy.exists(cls.model.select().where(cls.model.c[model_pk_name] == element_id)).select()
-            exists = (await cls.database.fetch_one(query))[0]
-            if not exists:
-                raise HTTPException(status_code=404)
+        """
 
-            query = cls.model.delete().where(cls.model.c[model_pk_name] == element_id)
-            await cls.database.execute(query)
-
-            return APIResponse(status_code=204)
-
-        return {"_delete": classmethod(delete)}
+        return {"_delete": delete}
 
 
 class ListMixin:
     @classmethod
-    def add_list(mcs, output_schema, **kwargs) -> typing.Dict[str, typing.Any]:
-        async def filter_(cls, *clauses, **filters) -> typing.List[typing.Dict]:
-            query = cls.model.select()
+    def _add_list(
+        mcs, name: str, verbose_name: str, output_schema: marshmallow.Schema, **kwargs
+    ) -> typing.Dict[str, typing.Any]:
+        async def filter(self, *clauses, **filters) -> typing.List[typing.Dict]:
+            query = self.model.select()
 
-            where_clauses = list(clauses) + [cls.model.c[k] == v for k, v in filters.items()]
+            where_clauses = tuple(clauses) + tuple(self.model.c[k] == v for k, v in filters.items())
 
             if where_clauses:
                 query = query.where(sqlalchemy.and_(*where_clauses))
 
-            return [dict(row) for row in await cls.database.fetch_all(query)]
+            return [dict(row) for row in await self.database.fetch_all(query)]
 
+        @resource_method("/", methods=["GET"], name=f"{name}-list")
         @Paginator.page_number
-        async def list_(cls, **kwargs) -> output_schema(many=True):
-            """
+        async def list(self, **kwargs) -> output_schema(many=True):
+            return await self._filter()  # noqa
+
+        list.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                List collection.
             description:
                 List resource collection.
             responses:
                 200:
                     description:
                         List collection items.
-            """
-            return await cls._filter()  # noqa
+        """
 
-        return {"_list": classmethod(list_), "_filter": classmethod(filter_)}
+        return {"_list": list, "_filter": filter}
 
 
 class DropMixin:
     @classmethod
-    def add_drop(mcs, database, **kwargs) -> typing.Dict[str, typing.Any]:
+    def _add_drop(
+        mcs, name: str, verbose_name: str, database: databases.Database, model: Model, **kwargs
+    ) -> typing.Dict[str, typing.Any]:
+        @resource_method("/", methods=["DELETE"], name=f"{name}-drop")
         @database.transaction()
-        async def drop(cls) -> DropSchema:
-            """
+        async def drop(self) -> DropSchema:
+            query = sqlalchemy.select([sqlalchemy.func.count(self.model.c[model.primary_key.name])])
+            result = next((i for i in (await self.database.fetch_one(query)).values()))
+
+            query = self.model.delete()
+            await self.database.execute(query)
+
+            return APIResponse(schema=DropSchema(), content={"deleted": result}, status_code=204)
+
+        drop.__doc__ = f"""
+            tags:
+                - {verbose_name}
+            summary:
+                Drop collection.
             description:
                 Drop resource collection.
             responses:
                 204:
                     description:
                         Collection dropped successfully.
-            """
-            query = cls.model.select().count()
-            result = (await cls.database.fetch_one(query))[0]
+        """
 
-            query = cls.model.delete()
-            await cls.database.execute(query)
-
-            return APIResponse(schema=DropSchema(), content={"deleted": result}, status_code=204)
-
-        return {"_drop": classmethod(drop)}
+        return {"_drop": drop}
 
 
-class Resource(BaseResource, CreateMixin, RetrieveMixin, UpdateMixin, DeleteMixin, ListMixin, DropMixin):
-    METHODS = {
-        "list": ("/", "GET"),  # List resource collection
-        "drop": ("/", "DELETE"),  # Drop resource entire collection
-        "create": ("/", "POST"),  # Create a new element for this resource
-        "retrieve": ("/{element_id}/", "GET"),  # Retrieve an element of this resource
-        "update": ("/{element_id}/", "PUT"),  # Update an element of this resource
-        "delete": ("/{element_id}/", "DELETE"),  # Delete an element of this resource
-    }
-    DEFAULT_METHODS = ("create", "retrieve", "update", "delete", "list")
+class CRUDResource(BaseResource, CreateMixin, RetrieveMixin, UpdateMixin, DeleteMixin):
+    METHODS = ("create", "retrieve", "update", "delete")
+
+
+class CRUDListResource(BaseResource, CreateMixin, RetrieveMixin, UpdateMixin, DeleteMixin, ListMixin):
+    METHODS = ("create", "retrieve", "update", "delete", "list")
+
+
+class CRUDListDropResource(BaseResource, CreateMixin, RetrieveMixin, UpdateMixin, DeleteMixin, ListMixin, DropMixin):
+    METHODS = ("create", "retrieve", "update", "delete", "list", "drop")

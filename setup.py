@@ -27,7 +27,7 @@ setup(
     name='starlette-api',  # Required
     # https://www.python.org/dev/peps/pep-0440/
     # https://packaging.python.org/en/latest/single_source_version.html
-    version='0.5.0',  # Required
+    version='0.6.2',  # Required
     # https://packaging.python.org/specifications/core-metadata/#summary
     description="Starlette API layer inherited from APIStar",  # Required
     # https://packaging.python.org/specifications/core-metadata/#description-optional
