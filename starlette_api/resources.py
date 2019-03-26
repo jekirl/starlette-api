@@ -4,16 +4,25 @@ import re
 import typing
 import uuid
 
-import databases
 import marshmallow
-import sqlalchemy
-from sqlalchemy.dialects import postgresql
 
 from starlette_api.applications import Starlette
 from starlette_api.exceptions import HTTPException
 from starlette_api.pagination import Paginator
 from starlette_api.responses import APIResponse
 from starlette_api.types import Model, PrimaryKey, ResourceMeta, ResourceMethodMeta
+
+try:
+    import sqlalchemy
+    from sqlalchemy.dialects import postgresql
+except Exception:  # pragma: no cover
+    raise AssertionError("`sqlalchemy` must be installed to use resources") from None
+
+try:
+    import databases
+except Exception:  # pragma: no cover
+    raise AssertionError("`databases` must be installed to use resources") from None
+
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +39,7 @@ PK_MAPPING = {
 }
 
 
-class DropSchema(marshmallow.Schema):
+class DropCollection(marshmallow.Schema):
     deleted = marshmallow.fields.Integer(title="deleted", description="Number of deleted elements", required=True)
 
 
@@ -415,14 +424,14 @@ class DropMixin:
     ) -> typing.Dict[str, typing.Any]:
         @resource_method("/", methods=["DELETE"], name=f"{name}-drop")
         @database.transaction()
-        async def drop(self) -> DropSchema:
+        async def drop(self) -> DropCollection:
             query = sqlalchemy.select([sqlalchemy.func.count(self.model.c[model.primary_key.name])])
             result = next((i for i in (await self.database.fetch_one(query)).values()))
 
             query = self.model.delete()
             await self.database.execute(query)
 
-            return APIResponse(schema=DropSchema(), content={"deleted": result}, status_code=204)
+            return APIResponse(schema=DropCollection(), content={"deleted": result}, status_code=204)
 
         drop.__doc__ = f"""
             tags:

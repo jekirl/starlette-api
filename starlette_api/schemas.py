@@ -9,6 +9,7 @@ import marshmallow
 from starlette import routing, schemas
 from starlette.responses import HTMLResponse
 
+from starlette_api.responses import APIError
 from starlette_api.types import EndpointInfo
 from starlette_api.utils import dict_safe_add
 
@@ -36,6 +37,26 @@ class OpenAPIResponse(schemas.OpenAPIResponse):
         return yaml.dump(content, default_flow_style=False, Dumper=YAMLDumper).encode("utf-8")
 
 
+class SchemaRegistry(dict):
+    def __init__(self, spec: apispec.APISpec, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec = spec
+        self.openapi = self.spec.plugins[0].openapi
+
+    def __getitem__(self, item):
+        try:
+            schema = super().__getitem__(item)
+        except KeyError:
+            component_schema = item if inspect.isclass(item) else item.__class__
+
+            self.spec.definition(name=component_schema.__name__, schema=component_schema)
+
+            schema = self.openapi.resolve_schema_dict(item)
+            super().__setitem__(item, schema)
+
+        return schema
+
+
 class SchemaGenerator(schemas.BaseSchemaGenerator):
     def __init__(self, title: str, version: str, description: str, openapi_version="3.0.0"):
         assert apispec is not None, "`apispec` must be installed to use SchemaGenerator."
@@ -50,6 +71,9 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
             plugins=[MarshmallowPlugin()],
         )
         self.openapi = self.spec.plugins[0].openapi
+
+        # Builtin definitions
+        self.schemas = SchemaRegistry(self.spec)
 
     def get_endpoints(
         self, routes: typing.List[routing.BaseRoute], base_path: str = ""
@@ -80,8 +104,8 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
                                 path=path,
                                 method=method.lower(),
                                 func=route.endpoint,
-                                query_fields=route.query_fields.get(method),
-                                path_fields=route.path_fields.get(method),
+                                query_fields=route.query_fields.get(method, {}),
+                                path_fields=route.path_fields.get(method, {}),
                                 body_field=route.body_field.get(method),
                                 output_field=route.output_field.get(method),
                             )
@@ -97,8 +121,8 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
                                 path=path,
                                 method=method.lower(),
                                 func=func,
-                                query_fields=route.query_fields.get(method.upper()),
-                                path_fields=route.path_fields.get(method.upper()),
+                                query_fields=route.query_fields.get(method.upper(), {}),
+                                path_fields=route.path_fields.get(method.upper(), {}),
                                 body_field=route.body_field.get(method.upper()),
                                 output_field=route.output_field.get(method.upper()),
                             )
@@ -108,13 +132,13 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
 
         return endpoints_info
 
-    def get_endpoint_parameters_schema(self, endpoint: EndpointInfo, schema: typing.Dict) -> typing.List[typing.Dict]:
+    def _add_endpoint_parameters(self, endpoint: EndpointInfo, schema: typing.Dict):
         schema["parameters"] = [
             self.openapi.field2parameter(field.schema, name=field.name, default_in=field.location.name)
             for field in itertools.chain(endpoint.query_fields.values(), endpoint.path_fields.values())
         ]
 
-    def get_endpoint_body_schema(self, endpoint: EndpointInfo, schema: typing.Dict):
+    def _add_endpoint_body(self, endpoint: EndpointInfo, schema: typing.Dict):
         component_schema = (
             endpoint.body_field.schema
             if inspect.isclass(endpoint.body_field.schema)
@@ -132,39 +156,48 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
             "schema",
         )
 
-    def get_endpoint_response_schema(self, endpoint: EndpointInfo, schema: typing.Dict):
-        component_schema = (
-            endpoint.output_field if inspect.isclass(endpoint.output_field) else endpoint.output_field.__class__
-        )
-
-        self.spec.definition(name=component_schema.__name__, schema=component_schema)
+    def _add_endpoint_response(self, endpoint: EndpointInfo, schema: typing.Dict):
+        response_codes = list(schema.get("responses", {}).keys())
+        main_response = response_codes[0] if response_codes else 200
 
         dict_safe_add(
             schema,
-            self.openapi.resolve_schema_dict(endpoint.output_field),
+            self.schemas[endpoint.output_field],
             "responses",
-            200,
+            main_response,
             "content",
             "application/json",
             "schema",
+        )
+
+    def _add_endpoint_default_response(self, schema: typing.Dict):
+        dict_safe_add(schema, self.schemas[APIError], "responses", "default", "content", "application/json", "schema")
+
+        # Default description
+        schema["responses"]["default"]["description"] = schema["responses"]["default"].get(
+            "description", "Unexpected error."
         )
 
     def get_endpoint_schema(self, endpoint: EndpointInfo) -> typing.Dict[str, typing.Any]:
         schema = self.parse_docstring(endpoint.func)
 
         # Query and Path parameters
-        self.get_endpoint_parameters_schema(endpoint, schema)
+        if endpoint.query_fields or endpoint.path_fields:
+            self._add_endpoint_parameters(endpoint, schema)
 
         # Body
         if endpoint.body_field:
-            self.get_endpoint_body_schema(endpoint, schema)
+            self._add_endpoint_body(endpoint, schema)
 
         # Response
         if endpoint.output_field and (
             (inspect.isclass(endpoint.output_field) and issubclass(endpoint.output_field, marshmallow.Schema))
             or isinstance(endpoint.output_field, marshmallow.Schema)
         ):
-            self.get_endpoint_response_schema(endpoint, schema)
+            self._add_endpoint_response(endpoint, schema)
+
+        # Default response
+        self._add_endpoint_default_response(schema)
 
         return schema
 
