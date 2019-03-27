@@ -50,6 +50,7 @@ setup(
     install_requires=[
         'starlette (>=0.11)',
         'marshmallow (>=3.0.0rc0,<4.0)',
+        'apispec[yaml] (>=1.0,<2.0)',
     ],  # Optional
     # https://setuptools.readthedocs.io/en/latest/setuptools.html#dependencies-that-aren-t-in-pypi
     dependency_links=[],  # Optional

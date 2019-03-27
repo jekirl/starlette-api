@@ -32,7 +32,7 @@ class OpenAPIResponse(schemas.OpenAPIResponse):
         assert apispec is not None, "`apispec` must be installed to use OpenAPIResponse."
         assert isinstance(content, dict), "The schema passed to OpenAPIResponse should be a dictionary."
 
-        from apispec.core import YAMLDumper
+        from apispec.yaml_utils import YAMLDumper
 
         return yaml.dump(content, default_flow_style=False, Dumper=YAMLDumper).encode("utf-8")
 
@@ -49,8 +49,10 @@ class SchemaRegistry(dict):
         except KeyError:
             component_schema = item if inspect.isclass(item) else item.__class__
 
-            self.spec.definition(name=component_schema.__name__, schema=component_schema)
-
+            try:
+                self.spec.components.schema(name=component_schema.__name__, schema=component_schema)
+            except apispec.exceptions.DuplicateComponentNameError:
+                pass
             schema = self.openapi.resolve_schema_dict(item)
             super().__setitem__(item, schema)
 
@@ -144,8 +146,10 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
             if inspect.isclass(endpoint.body_field.schema)
             else endpoint.body_field.schema.__class__
         )
-
-        self.spec.definition(name=component_schema.__name__, schema=component_schema)
+        try:
+            self.spec.components.schema(name=component_schema.__name__, schema=component_schema)
+        except apispec.exceptions.DuplicateComponentNameError:
+            pass #FIXME log an error
 
         dict_safe_add(
             schema,
@@ -205,7 +209,7 @@ class SchemaGenerator(schemas.BaseSchemaGenerator):
         endpoints_info = self.get_endpoints(routes)
 
         for path, endpoints in endpoints_info.items():
-            self.spec.add_path(path=path, operations={e.method: self.get_endpoint_schema(e) for e in endpoints})
+            self.spec.path(path=path, operations={e.method: self.get_endpoint_schema(e) for e in endpoints})
 
         return self.spec.to_dict()
 
