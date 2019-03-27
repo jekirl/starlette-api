@@ -2,12 +2,13 @@ import asyncio
 import inspect
 import typing
 from functools import wraps
-
+import dataclasses
 import marshmallow
 import starlette.routing
 from starlette.concurrency import run_in_threadpool
 from starlette.routing import Match, Mount
 from starlette.types import ASGIApp, ASGIInstance, Receive, Scope, Send
+from starlette.background import BackgroundTasks
 
 from starlette_api import http, websockets
 from starlette_api.components import Component
@@ -171,14 +172,19 @@ class Route(starlette.routing.Route, FieldsMixin):
                     response = await injected_func()
                 else:
                     response = await run_in_threadpool(injected_func)
+                tasks = None
+                if isinstance(response, tuple) and len(response) == 2 and isinstance(response[1], BackgroundTasks):
+                    response, tasks = response
 
                 # Wrap response data with a proper response class
-                if isinstance(response, (dict, list)):
+                if isinstance(response, (dict, list)) or dataclasses.is_dataclass(response):
                     response = APIResponse(content=response, schema=get_output_schema(endpoint))
                 elif isinstance(response, str):
                     response = APIResponse(content=response)
                 elif response is None:
-                    response = APIResponse(content="")
+                    response = APIResponse(content="")                    
+                if tasks is not None:
+                    response.background = tasks
 
                 await response(receive, send)
 

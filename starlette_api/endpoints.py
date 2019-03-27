@@ -1,5 +1,6 @@
 import asyncio
 import typing
+import dataclasses
 
 from starlette import status
 from starlette.concurrency import run_in_threadpool
@@ -56,7 +57,7 @@ class HTTPEndpoint(BaseHTTPEndpoint):
             response, tasks = response
 
         # Wrap response data with a proper response class
-        if isinstance(response, (dict, list)):
+        if isinstance(response, (dict, list)) or dataclasses.is_dataclass(response):
             response = APIResponse(content=response, schema=get_output_schema(handler))
         elif isinstance(response, str):
             response = APIResponse(content=response)
